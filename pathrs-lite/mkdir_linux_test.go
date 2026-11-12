@@ -70,6 +70,42 @@ var mkdirAll_MkdirAllHandle mkdirAllFunc = func(t *testing.T, root, unsafePath s
 	return nil
 }
 
+var mkdirAll_MkdirAllNoSymlinks mkdirAllFunc = func(_ *testing.T, root, unsafePath string, mode os.FileMode) error { //nolint:revive // underscores are more readable for test helpers
+	// We can't check expectedPath here.
+	return pathrs.MkdirAllNoSymlinks(root, unsafePath, mode)
+}
+
+var mkdirAll_MkdirAllHandleNoSymlinks mkdirAllFunc = func(t *testing.T, root, unsafePath string, mode os.FileMode) error { //nolint:revive // underscores are more readable for test helpers
+	// Same logic as MkdirAllNoSymlinks.
+	rootDir, err := os.OpenFile(root, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer rootDir.Close() //nolint:errcheck // test code
+	handle, err := pathrs.MkdirAllHandleNoSymlinks(rootDir, unsafePath, mode)
+	if err != nil {
+		return err
+	}
+	defer handle.Close() //nolint:errcheck // test code
+
+	// We can lookup the expected path again to get the full path. This will
+	// give a reasonable result because we aren't being attacked in this
+	// particular test.
+	handle2, err := pathrs.OpenatInRoot(rootDir, unsafePath)
+	require.NoError(t, err)
+	expectedPath, err := procfs.ProcSelfFdReadlink(handle2)
+	require.NoError(t, err)
+
+	// Now double-check that the handle is correct.
+	gotPath, err := procfs.ProcSelfFdReadlink(handle)
+	require.NoError(t, err, "get real path of returned handle")
+	assert.Equal(t, expectedPath, gotPath, "wrong final path from MkdirAllHandleNoSymlinks")
+	// Also check that the f.Name() is correct while we're at it (this is
+	// not always guaranteed but it's better to try at least).
+	assert.Equal(t, expectedPath, handle.Name(), "handle from MkdirAllHandleNoSymlinks has the wrong .Name()")
+	return nil
+}
+
 func checkMkdirAll(t *testing.T, mkdirAll mkdirAllFunc, root, unsafePath string, mode os.FileMode, expectedMode int, expectedErr error) {
 	rootDir, err := os.OpenFile(root, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	require.NoError(t, err)
@@ -218,6 +254,122 @@ func TestMkdirAll_Basic(t *testing.T) { //nolint:revive // underscores are more 
 
 func TestMkdirAllHandle_Basic(t *testing.T) { //nolint:revive // underscores are more readable for test helpers
 	testMkdirAll_Basic(t, mkdirAll_MkdirAllHandle)
+}
+
+func testMkdirAllNoSymlinks_Basic(t *testing.T, mkdirAll mkdirAllFunc) { //nolint:revive // underscores are more readable for test helpers
+	// We create a new tree for each test, but the template is the same.
+	tree := []string{
+		"dir a",
+		"dir b/c/d",
+		"file b/c/file",
+		// Symlinks to in-root directories and files.
+		"symlink dir-link b/c/d",
+		"symlink dir-abs-link /b/c/d",
+		"symlink b-file b/c/file",
+		"dir sub",
+		"symlink sub/parent-link ..",
+		// Dangling symlinks.
+		"symlink dangling1 fake",
+		"symlink dangling2 /fake/foo/bar",
+		"symlink dangling3 ../outside-of-root",
+		// Symlink loop.
+		"dir loop",
+		"symlink loop/link ../loop/link",
+	}
+
+	testutils.WithWithoutOpenat2(true, tRunWrapper(t), func(ti testutils.TestingT) {
+		t := ti.(*testing.T) //nolint:forcetypeassert // guaranteed to be true and in test code
+		for name, test := range map[string]struct {
+			unsafePath       string
+			expectedErr      error
+			expectedModeBits int
+		}{
+			// Plain directories (existing and new) work as usual.
+			"existing":           {unsafePath: "a"},
+			"existing-dotdot":    {unsafePath: "b/c/../c/d"},
+			"basic":              {unsafePath: "a/b/c/d/e/f/g"},
+			"basic-trailing-/":   {unsafePath: "a/b/c/"},
+			"dotdot-in-existing": {unsafePath: "b/c/../c/./d/e/f"},
+			// ".." components in the not-yet-created tail are still
+			// refused, as with MkdirAll.
+			"dotdot-in-nonexisting": {unsafePath: "a/b/c/d/e/../f", expectedErr: unix.ENOENT},
+			// Non-directory components in the middle of the path are
+			// refused.
+			"nondir-trailing": {unsafePath: "b/c/file", expectedErr: unix.ENOTDIR},
+			"nondir-subdir":   {unsafePath: "b/c/file/subdir", expectedErr: unix.ENOTDIR},
+			"nondir-dotdot":   {unsafePath: "b/c/file/../d", expectedErr: unix.ENOTDIR},
+			// Any symlink component (even one pointing inside the root)
+			// is refused.
+			"symlink-trailing":     {unsafePath: "dir-link", expectedErr: unix.ELOOP},
+			"symlink-basic":        {unsafePath: "dir-link/foo", expectedErr: unix.ELOOP},
+			"symlink-dotdot":       {unsafePath: "dir-link/../foo", expectedErr: unix.ELOOP},
+			"symlink-abs-trailing": {unsafePath: "dir-abs-link", expectedErr: unix.ELOOP},
+			"symlink-abs-basic":    {unsafePath: "dir-abs-link/foo", expectedErr: unix.ELOOP},
+			"symlink-parent":       {unsafePath: "sub/parent-link/a/b", expectedErr: unix.ELOOP},
+			"symlink-file":         {unsafePath: "b-file", expectedErr: unix.ELOOP},
+			"symlink-file-subdir":  {unsafePath: "b-file/subdir", expectedErr: unix.ELOOP},
+			// Dangling symlinks are also refused.
+			"dangling1-trailing": {unsafePath: "dangling1", expectedErr: unix.ELOOP},
+			"dangling1-basic":    {unsafePath: "dangling1/foo", expectedErr: unix.ELOOP},
+			"dangling1-dotdot":   {unsafePath: "dangling1/../bar", expectedErr: unix.ELOOP},
+			"dangling2-trailing": {unsafePath: "dangling2", expectedErr: unix.ELOOP},
+			"dangling2-basic":    {unsafePath: "dangling2/foo", expectedErr: unix.ELOOP},
+			"dangling3-trailing": {unsafePath: "dangling3", expectedErr: unix.ELOOP},
+			"dangling3-basic":    {unsafePath: "dangling3/foo", expectedErr: unix.ELOOP},
+			// Symlink loops are refused.
+			"loop-trailing": {unsafePath: "loop/link", expectedErr: unix.ELOOP},
+			"loop-basic":    {unsafePath: "loop/link/foo", expectedErr: unix.ELOOP},
+		} {
+			test := test // copy iterator
+			t.Run(name, func(t *testing.T) {
+				root := testutils.CreateTree(t, tree...)
+				const mode = 0o711
+				checkMkdirAll(t, mkdirAll, root, test.unsafePath, mode, test.expectedModeBits|mode, test.expectedErr)
+			})
+		}
+	})
+}
+
+func TestMkdirAllNoSymlinks_Basic(t *testing.T) { //nolint:revive // underscores are more readable for test helpers
+	testMkdirAllNoSymlinks_Basic(t, mkdirAll_MkdirAllNoSymlinks)
+}
+
+func TestMkdirAllHandleNoSymlinks_Basic(t *testing.T) { //nolint:revive // underscores are more readable for test helpers
+	testMkdirAllNoSymlinks_Basic(t, mkdirAll_MkdirAllHandleNoSymlinks)
+}
+
+func testMkdirAllNoSymlinks_OutsideRoot(t *testing.T, mkdirAll mkdirAllFunc) { //nolint:revive // underscores are more readable for test helpers
+	testutils.WithWithoutOpenat2(true, tRunWrapper(t), func(ti testutils.TestingT) {
+		t := ti.(*testing.T) //nolint:forcetypeassert // guaranteed to be true and in test code
+
+		root := t.TempDir()
+		outsideDir := t.TempDir()
+		// A symlink inside the root that points outside of the root.
+		err := os.Symlink(outsideDir, filepath.Join(root, "escape-link"))
+		require.NoError(t, err)
+
+		// Trying to create a directory through the symlink must fail, and
+		// must not create anything outside (or inside) the root.
+		err = mkdirAll(t, root, "escape-link/subdir", 0o755)
+		require.ErrorIs(t, err, unix.ELOOP, "MkdirAll through out-of-root symlink")
+
+		entries, err := os.ReadDir(outsideDir)
+		require.NoError(t, err)
+		assert.Empty(t, entries, "failed MkdirAllNoSymlinks created directories outside the root")
+
+		// The symlink itself must not have been replaced or augmented.
+		stat, err := os.Lstat(filepath.Join(root, "escape-link"))
+		require.NoError(t, err)
+		assert.Equal(t, os.ModeSymlink, stat.Mode()&os.ModeType, "escape-link should still be a plain symlink")
+	})
+}
+
+func TestMkdirAllNoSymlinks_OutsideRoot(t *testing.T) { //nolint:revive // underscores are more readable for test helpers
+	testMkdirAllNoSymlinks_OutsideRoot(t, mkdirAll_MkdirAllNoSymlinks)
+}
+
+func TestMkdirAllHandleNoSymlinks_OutsideRoot(t *testing.T) { //nolint:revive // underscores are more readable for test helpers
+	testMkdirAllNoSymlinks_OutsideRoot(t, mkdirAll_MkdirAllHandleNoSymlinks)
 }
 
 func TestMkdirAll_BadRoot(t *testing.T) { //nolint:revive // underscores are more readable for test helpers

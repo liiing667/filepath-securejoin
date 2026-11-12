@@ -53,3 +53,33 @@ func MkdirAll(root, unsafePath string, mode os.FileMode) error {
 	_ = f.Close()
 	return nil
 }
+
+// MkdirAllNoSymlinks is like [MkdirAll] except that no symlink components in
+// unsafePath are followed -- if any component of unsafePath is a symlink
+// (even a dangling one), an error is returned. Similarly, a non-directory
+// component in the middle of the path results in an error.
+//
+// This is primarily useful for callers that require the parent chain of the
+// new directory to only contain real directories (for instance, when
+// unpacking an archive into a directory tree where symlinks could be used to
+// redirect where entries get created). As with [MkdirAll], at no point will
+// any directories be created outside of the root.
+//
+// If you plan to open the directory after you have created it or want to use
+// an open directory handle as the root, you should use
+// [MkdirAllHandleNoSymlinks] instead. This function is a wrapper around
+// [MkdirAllHandleNoSymlinks].
+func MkdirAllNoSymlinks(root, unsafePath string, mode os.FileMode) error {
+	rootDir, err := os.OpenFile(root, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer rootDir.Close() //nolint:errcheck // close failures aren't critical here
+
+	f, err := MkdirAllHandleNoSymlinks(rootDir, unsafePath, mode)
+	if err != nil {
+		return err
+	}
+	_ = f.Close()
+	return nil
+}

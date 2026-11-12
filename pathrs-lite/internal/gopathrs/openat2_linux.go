@@ -100,3 +100,50 @@ func partialLookupOpenat2(root fd.Fd, unsafePath string) (*os.File, string, erro
 	}
 	return rootClone, unsafePath, lastError
 }
+
+// partialLookupNoSymlinksOpenat2 is an alternative implementation of
+// partialLookupNoSymlinks, using openat2(RESOLVE_NO_SYMLINKS) to more safely
+// get a handle to the deepest existing child of the requested path within
+// the root, without following any symlinks.
+func partialLookupNoSymlinksOpenat2(root fd.Fd, unsafePath string) (*os.File, string, error) {
+	// TODO: Implement this as a git-bisect-like binary search.
+
+	unsafePath = filepath.ToSlash(unsafePath) // noop
+	endIdx := len(unsafePath)
+	var lastError error
+	for endIdx > 0 {
+		subpath := unsafePath[:endIdx]
+
+		handle, err := openat2(root, subpath, &unix.OpenHow{
+			Flags:   unix.O_PATH | unix.O_CLOEXEC,
+			Resolve: unix.RESOLVE_IN_ROOT | unix.RESOLVE_NO_SYMLINKS,
+		})
+		if err == nil {
+			// Jump over the slash if we have a non-"" remainingPath.
+			if endIdx < len(unsafePath) {
+				endIdx++
+			}
+			// We found a subpath!
+			return handle, unsafePath[endIdx:], lastError
+		}
+		if errors.Is(err, unix.ENOENT) {
+			// That path doesn't exist, let's try the next directory up.
+			endIdx = strings.LastIndexByte(subpath, '/')
+			lastError = err
+			continue
+		}
+		// Any other error is a hard error -- in particular, ELOOP (a symlink
+		// component, even a dangling one) and ENOTDIR (a non-directory
+		// component in the middle of the path) must not be treated as
+		// "component does not exist".
+		return nil, "", fmt.Errorf("open subpath: %w", err)
+	}
+	// If we couldn't open anything, the whole subpath is missing. Return a
+	// copy of the root fd so that the caller doesn't close this one by
+	// accident.
+	rootClone, err := fd.Dup(root)
+	if err != nil {
+		return nil, "", err
+	}
+	return rootClone, unsafePath, lastError
+}

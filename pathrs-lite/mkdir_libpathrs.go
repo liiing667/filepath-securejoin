@@ -15,6 +15,8 @@ import (
 	"os"
 
 	"cyphar.com/go-pathrs"
+
+	"github.com/cyphar/filepath-securejoin/pathrs-lite/internal/gopathrs"
 )
 
 // MkdirAllHandle is equivalent to [MkdirAll], except that it is safer to use
@@ -49,4 +51,23 @@ func MkdirAllHandle(root *os.File, unsafePath string, mode os.FileMode) (*os.Fil
 		return nil, err
 	}
 	return handle.IntoFile(), nil
+}
+
+// MkdirAllHandleNoSymlinks is like [MkdirAllHandle] except that no symlink
+// components in unsafePath are followed -- if any component of unsafePath is
+// a symlink (even a dangling one), an error is returned. Similarly, a
+// non-directory component in the middle of the path results in an error.
+//
+// This is primarily useful for callers that require the parent chain of the
+// new directory to only contain real directories (for instance, when
+// unpacking an archive into a directory tree where symlinks could be used to
+// redirect where entries get created). As with [MkdirAllHandle], at no point
+// will any directories be created outside of the root.
+//
+// NOTE: libpathrs does not currently provide a no-symlinks mkdir_all
+// operation, so this is implemented using the same pure-Go resolver as the
+// non-libpathrs backend (guaranteeing identical behaviour for both
+// backends).
+func MkdirAllHandleNoSymlinks(root *os.File, unsafePath string, mode os.FileMode) (*os.File, error) {
+	return gopathrs.MkdirAllHandleNoSymlinks(root, unsafePath, mode)
 }

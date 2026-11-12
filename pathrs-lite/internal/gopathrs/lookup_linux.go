@@ -174,6 +174,150 @@ func PartialLookupInRoot(root fd.Fd, unsafePath string) (*os.File, string, error
 	return lookupInRoot(root, unsafePath, true)
 }
 
+// PartialLookupInRootNoSymlinks is like [PartialLookupInRoot] except that no
+// symlink components are followed (a-la RESOLVE_NO_SYMLINKS) -- if any
+// component of the requested path is a symlink (even a dangling one), an
+// ELOOP error is returned. Similarly, a non-directory component in the
+// middle of the path results in an ENOTDIR error rather than being treated
+// as a non-existent component.
+func PartialLookupInRootNoSymlinks(root fd.Fd, unsafePath string) (*os.File, string, error) {
+	// Try to use openat2 if possible (see the note in lookupInRoot about why
+	// falling back on openat2 failure would be a bad idea).
+	if handle, remainingPath, err := partialLookupNoSymlinksOpenat2(root, unsafePath); err == nil || linux.HasOpenat2() {
+		return handle, remainingPath, err
+	}
+	return partialLookupNoSymlinks(root, unsafePath)
+}
+
+// partialLookupNoSymlinks is a fallback implementation of
+// [PartialLookupInRootNoSymlinks] for kernels without openat2(2), using a
+// component-wise O_PATH|O_NOFOLLOW walk. Each component must be a real
+// directory -- symlinks result in ELOOP and non-directories result in
+// ENOTDIR.
+func partialLookupNoSymlinks(root fd.Fd, unsafePath string) (Handle *os.File, _ string, _ error) {
+	unsafePath = filepath.ToSlash(unsafePath) // noop
+
+	// Get the "actual" root path from /proc/self/fd. This is necessary if the
+	// root is some magic-link like /proc/$pid/root, in which case we want to
+	// make sure when we do procfs.CheckProcSelfFdPath that we are using the
+	// correct root path.
+	logicalRootPath, err := procfs.ProcSelfFdReadlink(root)
+	if err != nil {
+		return nil, "", fmt.Errorf("get real root path: %w", err)
+	}
+
+	currentDir, err := fd.Dup(root)
+	if err != nil {
+		return nil, "", fmt.Errorf("clone root fd: %w", err)
+	}
+	defer func() {
+		// If a handle is not returned, close the internal handle.
+		if Handle == nil {
+			_ = currentDir.Close()
+		}
+	}()
+
+	var (
+		currentPath   string
+		remainingPath = unsafePath
+	)
+	for remainingPath != "" {
+		// Save the current remaining path so if the part is not real we can
+		// return the path including the component.
+		oldRemainingPath := remainingPath
+
+		// Get the next path component.
+		var part string
+		if i := strings.IndexByte(remainingPath, '/'); i == -1 {
+			part, remainingPath = remainingPath, ""
+		} else {
+			part, remainingPath = remainingPath[:i], remainingPath[i+1:]
+		}
+		// If we hit an empty component, we need to treat it as though it is
+		// "." so that trailing "/" and "//" components on a non-directory
+		// correctly return the right error code.
+		if part == "" {
+			part = "."
+		}
+
+		// Apply the component lexically to the path we are building.
+		// currentPath does not contain any symlinks, and we are lexically
+		// dealing with a single component, so it's okay to do a filepath.Clean
+		// here.
+		nextPath := path.Join("/", currentPath, part)
+		// If we logically hit the root, just clone the root rather than
+		// opening the part and doing all of the other checks.
+		if nextPath == "/" {
+			// Jump to root.
+			rootClone, err := fd.Dup(root)
+			if err != nil {
+				return nil, "", fmt.Errorf("clone root fd: %w", err)
+			}
+			_ = currentDir.Close()
+			currentDir = rootClone
+			currentPath = "/"
+			continue
+		}
+
+		// Open the next component. O_NOFOLLOW means that a symlink component
+		// will fail with ELOOP (this includes dangling symlinks).
+		nextDir, err := fd.Openat(currentDir, part, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if errors.Is(err, unix.ENOENT) {
+			// We have hit a component that doesn't exist, so we have our
+			// partial open result. Note that we have to use the OLD remaining
+			// path, since the lookup failed.
+			return currentDir, oldRemainingPath, err
+		} else if err != nil {
+			return nil, "", err
+		}
+
+		// The component must be a real directory. Note that O_NOFOLLOW
+		// combined with O_PATH does not return ELOOP for symlinks -- it
+		// opens the symlink itself -- so we have to check the type of the
+		// component explicitly.
+		stat, err := fd.Fstat(nextDir)
+		if err != nil {
+			_ = nextDir.Close()
+			return nil, "", fmt.Errorf("stat opened component %q: %w", part, err)
+		}
+		switch stat.Mode & unix.S_IFMT {
+		case unix.S_IFDIR:
+			// Walk into the directory (handled below).
+		case unix.S_IFLNK:
+			_ = nextDir.Close()
+			return nil, "", &os.PathError{Op: "securejoin.partialLookupNoSymlinks", Path: logicalRootPath + nextPath, Err: unix.ELOOP}
+		default:
+			_ = nextDir.Close()
+			return nil, "", &os.PathError{Op: "securejoin.partialLookupNoSymlinks", Path: logicalRootPath + nextPath, Err: unix.ENOTDIR}
+		}
+
+		_ = currentDir.Close()
+		currentDir = nextDir
+		currentPath = nextPath
+
+		// If we are operating on a .., make sure we haven't escaped.
+		// We only have to check for ".." here because walking down
+		// into a regular component component cannot cause you to
+		// escape. This mirrors the logic in RESOLVE_IN_ROOT, except we
+		// have to check every ".." rather than only checking after a
+		// rename or mount on the system.
+		if part == ".." {
+			// Make sure the root hasn't moved.
+			if err := procfs.CheckProcSelfFdPath(logicalRootPath, root); err != nil {
+				return nil, "", fmt.Errorf("root path moved during lookup: %w", err)
+			}
+			// Make sure the path is what we expect.
+			fullPath := logicalRootPath + nextPath
+			if err := procfs.CheckProcSelfFdPath(fullPath, currentDir); err != nil {
+				return nil, "", fmt.Errorf("walking into %q had unexpected result: %w", part, err)
+			}
+		}
+	}
+
+	// All of the components existed!
+	return currentDir, "", nil
+}
+
 func completeLookupInRoot(root fd.Fd, unsafePath string) (*os.File, error) {
 	handle, remainingPath, err := lookupInRoot(root, unsafePath, false)
 	if remainingPath != "" && err == nil {

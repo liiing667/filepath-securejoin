@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 ## [Unreleased] ##
 
+### Added ###
+- `pathrs-lite` now provides `MkdirAllNoSymlinks` and
+  `MkdirAllHandleNoSymlinks`, which are like `MkdirAll` and `MkdirAllHandle`
+  except that no symlink components in the path are followed (a-la
+  `RESOLVE_NO_SYMLINKS`) -- any symlink component (even a dangling one)
+  results in an `ELOOP` error, and a non-directory component in the middle of
+  the path results in an `ENOTDIR` error. This is useful for callers that
+  require the parent chain of the new directory to only contain real
+  directories (such as when unpacking archives). As with `MkdirAll`, no
+  directories are ever created outside of the root. Both the pure-Go and
+  `libpathrs` backends provide identical behaviour.
+
 ## [0.7.0] - 2025-06-17 ##
 
 > You talk of times of peace for all, and then prepare for war.

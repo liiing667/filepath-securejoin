@@ -77,7 +77,26 @@ func toUnixMode(mode os.FileMode) (uint32, error) {
 // should use MkdirAllHandle.
 //
 // [SecureJoin]: https://pkg.go.dev/github.com/cyphar/filepath-securejoin#SecureJoin
-func MkdirAllHandle(root *os.File, unsafePath string, mode os.FileMode) (_ *os.File, Err error) {
+func MkdirAllHandle(root *os.File, unsafePath string, mode os.FileMode) (*os.File, error) {
+	return mkdirAllHandle(root, unsafePath, mode, PartialLookupInRoot)
+}
+
+// MkdirAllHandleNoSymlinks is like [MkdirAllHandle] except that no symlink
+// components in unsafePath are followed (a-la RESOLVE_NO_SYMLINKS) -- if any
+// component of unsafePath is a symlink (even a dangling one), an ELOOP error
+// is returned. Similarly, a non-directory component in the middle of the
+// path results in an ENOTDIR error.
+//
+// This is primarily useful for callers that require the parent chain of the
+// new directory to only contain real directories (for instance, when
+// unpacking an archive into a directory tree where symlinks could be used to
+// redirect where entries get created). As with [MkdirAllHandle], at no point
+// will any directories be created outside of the root.
+func MkdirAllHandleNoSymlinks(root *os.File, unsafePath string, mode os.FileMode) (*os.File, error) {
+	return mkdirAllHandle(root, unsafePath, mode, PartialLookupInRootNoSymlinks)
+}
+
+func mkdirAllHandle(root *os.File, unsafePath string, mode os.FileMode, partialLookup func(root fd.Fd, unsafePath string) (*os.File, string, error)) (_ *os.File, Err error) {
 	unixMode, err := toUnixMode(mode)
 	if err != nil {
 		return nil, err
@@ -91,7 +110,7 @@ func MkdirAllHandle(root *os.File, unsafePath string, mode os.FileMode) (_ *os.F
 	}
 
 	// Try to open as much of the path as possible.
-	currentDir, remainingPath, err := PartialLookupInRoot(root, unsafePath)
+	currentDir, remainingPath, err := partialLookup(root, unsafePath)
 	defer func() {
 		if Err != nil {
 			_ = currentDir.Close()
